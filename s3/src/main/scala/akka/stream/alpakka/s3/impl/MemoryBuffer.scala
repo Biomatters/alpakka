@@ -4,6 +4,7 @@
 
 package akka.stream.alpakka.s3.impl
 
+import akka.NotUsed
 import akka.stream.{Attributes, FlowShape, Inlet, Outlet}
 import akka.stream.scaladsl.Source
 import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
@@ -42,8 +43,14 @@ private[alpakka] final class MemoryBuffer(maxSize: Int) extends GraphStage[FlowS
         completeStage()
       }
 
-      def emit(): Unit = emit(out, Chunk(Source.single(buffer), buffer.size), () => completeStage())
+      def emit(): Unit = emit(out, MemoryBufferedChunk(buffer, buffer.size), () => completeStage())
       setHandlers(in, out, this)
     }
 
+}
+
+private[alpakka] final case class MemoryBufferedChunk(buffer: ByteString, override val size: Int) extends Chunk(size) {
+
+  override def data: Source[ByteString, NotUsed] =
+    Source.single(buffer)
 }

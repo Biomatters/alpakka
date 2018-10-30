@@ -8,4 +8,7 @@ import akka.stream.scaladsl.Source
 import akka.NotUsed
 import akka.util.ByteString
 
-private[alpakka] final case class Chunk(data: Source[ByteString, NotUsed], size: Int)
+private[alpakka] abstract class Chunk(val size: Int) {
+
+  def data: Source[ByteString, NotUsed]
+}

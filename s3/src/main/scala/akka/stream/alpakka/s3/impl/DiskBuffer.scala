@@ -16,7 +16,7 @@ import akka.stream.Attributes
 import akka.stream.FlowShape
 import akka.stream.Inlet
 import akka.stream.Outlet
-import akka.stream.scaladsl.FileIO
+import akka.stream.scaladsl.{FileIO, Source}
 import akka.stream.stage.GraphStage
 import akka.stream.stage.GraphStageLogic
 import akka.stream.stage.InHandler
@@ -79,17 +79,25 @@ private[alpakka] final class DiskBuffer(maxMaterializations: Int, maxSize: Int, 
       private def emit(): Unit = {
         pathOut.close()
 
-        val deleteCounter = new AtomicInteger(maxMaterializations)
-        val src = FileIO.fromPath(path.toPath, 65536).mapMaterializedValue { f =>
-          if (deleteCounter.decrementAndGet() <= 0)
-            f.onComplete { _ =>
-              path.delete()
-
-            }(ExecutionContexts.sameThreadExecutionContext)
-          NotUsed
-        }
-        emit(out, Chunk(src, length), () => completeStage())
+        emit(out, DiskBufferedChunk(path, maxMaterializations, length), () => completeStage())
       }
       setHandlers(in, out, this)
     }
+}
+
+private[alpakka] final case class DiskBufferedChunk(file: File, maxMaterializations: Int, override val size: Int)
+    extends Chunk(size) {
+
+  override def data: Source[ByteString, NotUsed] = {
+
+    val deleteCounter = new AtomicInteger(maxMaterializations)
+
+    FileIO.fromPath(file.toPath, 65536).mapMaterializedValue { f =>
+      if (deleteCounter.decrementAndGet() <= 0)
+        f.onComplete { _ =>
+          file.delete()
+        }(ExecutionContexts.sameThreadExecutionContext)
+      NotUsed
+    }
+  }
 }

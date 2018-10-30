@@ -58,6 +58,7 @@ sealed trait ApiVersion {
 case object ListBucketVersion1 extends ApiVersion {
   override val getInstance: ApiVersion = ListBucketVersion1
 }
+
 case object ListBucketVersion2 extends ApiVersion {
   override val getInstance: ApiVersion = ListBucketVersion2
 }
@@ -333,8 +334,9 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
       s3Headers: S3Headers,
       chunkSize: Int,
       parallelism: Int,
-      sse: Option[ServerSideEncryption]
-  ): Flow[ByteString, (HttpRequest, (MultipartUpload, Int)), NotUsed] = {
+      sse: Option[ServerSideEncryption],
+      maxRetries: Int
+  ): Flow[ByteString, (() => HttpRequest, (MultipartUpload, Int)), NotUsed] = {
 
     assert(
       chunkSize >= MinChunkSize,
@@ -351,26 +353,84 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
                        sse.fold[Seq[HttpHeader]](Seq.empty) { _.headersFor(InitiateMultipartUpload) }
                      ))
 
-    val headers: S3Headers = S3Headers(sse.fold[Seq[HttpHeader]](Seq.empty) { _.headersFor(UploadPart) })
+    val headers: S3Headers = S3Headers(sse.fold[Seq[HttpHeader]](Seq.empty) {
+      _.headersFor(UploadPart)
+    })
 
     SplitAfterSize(chunkSize)(atLeastOneByteString)
-      .via(getChunkBuffer(chunkSize)) //creates the chunks
+      .via(getChunkBuffer(chunkSize, maxRetries)) //creates the chunks
       .concatSubstreams
       .zipWith(requestInfo) {
-        case (chunkedPayload, (uploadInfo, chunkIndex)) =>
+        case (chunk, (uploadInfo, chunkIndex)) =>
           //each of the payload requests are created
-          val partRequest =
-            uploadPartRequest(uploadInfo, chunkIndex, chunkedPayload.data, chunkedPayload.size, headers)
-          (partRequest, (uploadInfo, chunkIndex))
+          val requestFactory = () => uploadPartRequest(uploadInfo, chunkIndex, chunk.data, chunk.size, headers)
+          (requestFactory, (uploadInfo, chunkIndex))
       }
-      .mapAsync(parallelism) { case (req, info) => Signer.signedRequest(req, signingKey).zip(Future.successful(info)) }
   }
 
-  private def getChunkBuffer(chunkSize: Int) = settings.bufferType match {
+  private def getChunkBuffer(chunkSize: Int, maxMaterializations: Int) = settings.bufferType match {
     case MemoryBufferType =>
       new MemoryBuffer(chunkSize * 2)
     case d @ DiskBufferType(_) =>
       new DiskBuffer(2, chunkSize * 2, d.path)
+  }
+
+  private def submitChunkRequest(requestFactory: () => HttpRequest,
+                                 upload: MultipartUpload,
+                                 chunkIndex: Int,
+                                 attempts: Int,
+                                 maxRetries: Int): Future[UploadPartResponse] = {
+
+    import mat.executionContext
+
+    val result = Signer
+      .signedRequest(requestFactory(), signingKey)
+      .flatMap(Http().singleRequest(_))
+      .flatMap { response =>
+        println(
+          s"${Instant.now().toString} Finished upload of chunk $chunkIndex with status ${response.status.intValue()}"
+        )
+        if (response.status.isFailure()) {
+          // Assume any 5xx error from S3 is transient.
+          val retriable = response.status.intValue() >= 500
+          Unmarshal(response.entity).to[String].map { errorBody =>
+            (FailedUploadPart(
+               upload,
+               chunkIndex,
+               new RuntimeException(
+                 s"Upload part request failed. Response header: ($response), response body: ($errorBody)."
+               )
+             ),
+             retriable)
+          }
+        } else {
+          response.entity.dataBytes.runWith(Sink.ignore)
+          response.headers.find(_.lowercaseName() == "etag").map(_.value) match {
+            case Some(t) =>
+              Future.successful((SuccessfulUploadPart(upload, chunkIndex, t), false))
+            case None =>
+              Future.successful(
+                (FailedUploadPart(upload, chunkIndex, new RuntimeException(s"Cannot find etag in $response")), false)
+              )
+          }
+        }
+      }
+      .recover {
+        case t: Throwable =>
+          // Assume this is a transient error.
+          (FailedUploadPart(upload, chunkIndex, t), true)
+      }
+
+    result flatMap {
+      case (fup: FailedUploadPart, true) =>
+        if (attempts < maxRetries) {
+          submitChunkRequest(requestFactory, upload, chunkIndex, attempts + 1, maxRetries)
+        } else {
+          Future.successful(fup)
+        }
+      case (resp: UploadPartResponse, _) =>
+        Future.successful(resp)
+    }
   }
 
   private def chunkAndRequest(
@@ -383,37 +443,20 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
 
     import mat.executionContext
 
+    val maxRetries = 10
+
     // Multipart upload requests (except for the completion api) are created here.
     //  The initial upload request gets executed within this function as well.
     //  The individual upload part requests are created.
-    val requestFlow = createRequests(s3Location, contentType, s3Headers, chunkSize, parallelism, sse)
+    val requestFlow = createRequests(s3Location, contentType, s3Headers, chunkSize, parallelism, sse, maxRetries)
 
-    // The individual upload part requests are processed here
+    // The individual upload part requests are signed and submitted here.
     requestFlow
-      .via(Http().superPool[(MultipartUpload, Int)]())
       .mapAsync(parallelism) {
-        case (Success(r), (upload, index)) =>
-          if (r.status.isFailure()) {
-            Unmarshal(r.entity).to[String].map { errorBody =>
-              FailedUploadPart(
-                upload,
-                index,
-                new RuntimeException(
-                  s"Upload part $index request failed. Response header: ($r), response body: ($errorBody)."
-                )
-              )
-            }
-          } else {
-            r.entity.dataBytes.runWith(Sink.ignore)
-            val etag = r.headers.find(_.lowercaseName() == "etag").map(_.value)
-            etag
-              .map(t => Future.successful(SuccessfulUploadPart(upload, index, t)))
-              .getOrElse(
-                Future.successful(FailedUploadPart(upload, index, new RuntimeException(s"Cannot find etag in ${r}")))
-              )
-          }
-
-        case (Failure(e), (upload, index)) => Future.successful(FailedUploadPart(upload, index, e))
+        case (req, (upload, chunkIndex)) =>
+          val key = signingKey
+          println(s"${Instant.now().toString} Signing request for chunk $chunkIndex with key: ${key.credentialString}")
+          submitChunkRequest(req, upload, chunkIndex, 0, maxRetries)
       }
   }
 
@@ -507,7 +550,9 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
                        sse.fold[Seq[HttpHeader]](Seq.empty) { _.headersFor(InitiateMultipartUpload) }
                      ))
 
-    val headers: S3Headers = S3Headers(sse.fold[Seq[HttpHeader]](Seq.empty) { _.headersFor(CopyPart) })
+    val headers: S3Headers = S3Headers(sse.fold[Seq[HttpHeader]](Seq.empty) {
+      _.headersFor(CopyPart)
+    })
 
     requestInfo
       .zipWith(partitions) {
